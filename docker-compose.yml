@@ -1,21 +1,18 @@
 version: "3"
 
 x-stock-base: &stock-base
-  build: { context: ., dockerfile: stock/Dockerfile }
   image: stock:latest
   restart: always
   command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env ]
 
 x-payment-base: &payment-base
-  build: { context: ., dockerfile: payment/Dockerfile }
   image: payment:latest
   restart: always
   command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env ]
 
 x-order-base: &order-base
-  build: { context: ., dockerfile: order/Dockerfile }
   image: order:latest
   restart: always
   command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
@@ -56,6 +53,7 @@ services:
 
   order-service-0:
     <<: *order-base
+    build: { context: ., dockerfile: order/Dockerfile }
     environment:
       SHARD_ID: "0"
       SHARD_COUNT: "5"
@@ -129,6 +127,7 @@ services:
 
   stock-service-0:
     <<: *stock-base
+    build: { context: ., dockerfile: stock/Dockerfile }
     environment:
       SHARD_ID: "0"
       SHARD_COUNT: "5"
@@ -197,6 +196,7 @@ services:
 
   payment-service-0:
     <<: *payment-base
+    build: { context: ., dockerfile: payment/Dockerfile }
     environment:
       SHARD_ID: "0"
       SHARD_COUNT: "5"
