@@ -1,239 +1,229 @@
-# Architecture
+r# System Architecture
 
-Distributed e-commerce system built with Python/Flask and Redis. Three microservices — **order**, **stock**, and **payment** — each run 5 sharded instances behind an NGINX gateway on port 8000.
+This document describes the current runtime architecture of the distributed e-commerce system and focuses on five questions:
 
-## System Topology
+1. How the gateway works
+2. How many services we have
+3. How services communicate (including queues/streams and sharing)
+4. How messages are read and processed (worker model)
+5. How many threads/processes run inside each service
 
-**36 containers total:**
+## 1) High-Level Topology
 
-| Category | Containers | Count |
-|----------|-----------|-------|
-| Gateway | `gateway` (NGINX) | 1 |
-| App services | `{order,stock,payment}-service-{0..4}` | 15 |
-| Business DBs | `{order,stock,payment}-db-{0..4}` (Redis 7.2) | 15 |
-| Saga brokers | `saga-redis-{0..4}` (Redis 7.2) | 5 |
+The system has three business services:
 
-Each app service runs Gunicorn with 2 gevent workers (1000 connections/worker, 30s timeout) on port 5000 internally.
+- Order service
+- Stock service
+- Payment service
 
-Business Redis instances have 512MB max memory; saga-redis instances have 256MB.
+Each business service is sharded into 5 instances (shard IDs 0..4), for a total of 15 app containers.
 
-## Data Models
+In addition:
 
-All models are serialized with MessagePack via `msgspec`.
+- 1 NGINX gateway container (external entrypoint on port 8000)
+- 15 business Redis containers (one Redis per service shard)
+- 5 saga Redis containers (one message-broker Redis per shard)
 
-- **OrderValue**: `paid: bool`, `items: list[tuple[str, int]]`, `user_id: str`, `total_cost: int`
-- **StockValue**: `stock: int`, `price: int`
-- **UserValue**: `credit: int`
+Total in docker-compose: 36 containers.
 
-## Sharding
+## 2) Gateway Behavior (NGINX)
 
-Requests are routed to the correct shard via CRC32-based hashing, compatible with NGINX's `hash` directive (Cache::Memcached algorithm):
+Gateway config: gateway_nginx.conf
 
-```python
-def compute_shard(key: str, num_shards: int) -> int:
-    crc = binascii.crc32(key.encode()) & 0xFFFFFFFF
-    return ((crc >> 16) & 0x7FFF) % num_shards
-```
+The gateway is a smart router, not just a reverse proxy.
 
-NGINX extracts the resource ID from the URL (e.g., `/stock/find/<id>`) and hashes it to select an upstream server. The Python services use the same hash function for inter-service stream routing.
+### 2.1 Request routing strategy
 
-**Shard-affine UUID generation** (`common/streams.py`): When creating a resource, the service brute-forces UUIDs until one hashes to the current shard. This guarantees future requests for that resource route back to the same instance (~`num_shards` iterations on average).
+For each service path prefix:
 
-**Batch init broadcast**: `batch_init` endpoints are mirrored to all shards via NGINX `mirror` directives — shard 0 is the primary target; shards 1–4 receive mirrored copies.
+- /orders/
+- /stock/
+- /payment/
 
-## REST API
+the gateway extracts the resource identifier from the URL using map rules, then uses upstream hash routing to pick a shard.
 
-### Order Service (`/orders/`)
+Examples:
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/create/<user_id>` | Create order with shard-affine UUID |
-| GET | `/find/<order_id>` | Fetch order |
-| POST | `/addItem/<order_id>/<item_id>/<quantity>` | Add item (calls `/stock/find/` via gateway) |
-| POST | `/checkout/<order_id>` | Checkout (saga or 2PC based on `CHECKOUT_MODE`) |
-| POST | `/batch_init/<n>/<n_items>/<n_users>/<item_price>` | Bulk create orders |
+- /stock/find/<item_id> hashes by item_id
+- /payment/find_user/<user_id> hashes by user_id
+- /orders/find/<order_id> hashes by order_id
+- /orders/addItem/<order_id>/... hashes by order_id
 
-### Stock Service (`/stock/`)
+This guarantees that requests for the same resource ID consistently reach the same shard.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/item/create/<price>` | Create item with shard-affine UUID |
-| GET | `/find/<item_id>` | Fetch item (stock + price) |
-| POST | `/add/<item_id>/<amount>` | Add stock |
-| POST | `/subtract/<item_id>/<amount>` | Subtract stock |
-| POST | `/batch_init/<n>/<starting_stock>/<item_price>` | Bulk create items |
+### 2.2 Hash compatibility with Python
 
-### Payment Service (`/payment/`)
+Python services use the same hash formula as NGINX (Cache::Memcached-compatible):
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/create_user` | Create user with shard-affine UUID |
-| GET | `/find_user/<user_id>` | Fetch user credit |
-| POST | `/add_funds/<user_id>/<amount>` | Add credit |
-| POST | `/pay/<user_id>/<amount>` | Deduct credit |
-| POST | `/batch_init/<n>/<starting_money>` | Bulk create users |
+((crc32(key) >> 16) & 0x7fff) % num_shards
 
-## Inter-Service Messaging
+This is critical because services must route async commands to the same shard that gateway routing would select for direct REST calls.
 
-Services communicate asynchronously via Redis Streams on the sharded `saga-redis` instances.
+### 2.3 Batch initialization broadcast
 
-**Stream names** (per shard):
-- `stock-commands-{shard_id}` — commands to stock service
-- `payment-commands-{shard_id}` — commands to payment service
-- `saga-replies-{shard_id}` — replies back to order service
+batch_init endpoints are special-cased:
 
-**Consumer groups**: `stock-workers`, `payment-workers`, `orchestrator-workers`
+- Primary request is sent to shard 0
+- NGINX mirror sends copies to shards 1..4
 
-**Connection pool** (`common/streams.py`): `init_saga_pool()` creates one Redis connection per shard using the `SAGA_REDIS_HOST_TEMPLATE` (`saga-redis-{}`). All publish functions transparently route to the correct connection by extracting the shard index from the stream name suffix.
+So batch initialization is broadcast across all shards.
 
-**Command message fields**: `saga_id`, `idempotency_key`, `command`, `payload`, `reply_stream`
+## 3) Services and Data Isolation
 
-**Reply message fields**: `saga_id`, `idempotency_key`, `command`, `status`, `reason`
+There are 3 logical services and each is independently sharded.
 
-The consumer loop uses `XREADGROUP` with 1s block timeout and processes 10 messages per call. Consumer names follow the format `{hostname}-{pid}`.
+- Order: order-service-{0..4} with order-db-{0..4}
+- Stock: stock-service-{0..4} with stock-db-{0..4}
+- Payment: payment-service-{0..4} with payment-db-{0..4}
 
-## Saga Protocol (`CHECKOUT_MODE=saga`)
+Important isolation rule:
 
-Orchestrated saga with compensating transactions for checkout. The order service acts as the orchestrator.
+- No shared business database between services
+- Each shard talks only to its own business Redis for service data
 
-### State Machine
+The saga Redis layer is shared only for inter-service messaging, not for business state.
 
-```
-STARTED → STOCK_SUBTRACTING → PAYMENT_PENDING → COMPLETED
-                ↓                    ↓
-          STOCK_COMPENSATING ← ← ← ←
-                ↓
-             FAILED
-```
+## 4) Inter-Service Communication
 
-Stored as `saga:{order_id}` in order-db (msgpack-encoded `SagaState`).
+Communication is mixed-mode:
 
-### Flow
+- Synchronous REST via gateway for regular read/update flows (example: order addItem checks stock via /stock/find/...)
+- Asynchronous Redis Streams for checkout orchestration (saga and 2PC)
 
-1. **STARTED → STOCK_SUBTRACTING**: Sends `stock_subtract` commands sequentially, one item at a time, to the correct stock shard's stream based on `compute_shard(item_id)`.
-2. **STOCK_SUBTRACTING → PAYMENT_PENDING**: After all items subtracted, sends `payment_pay` to the payment shard for the order's `user_id`.
-3. **PAYMENT_PENDING → COMPLETED**: Payment succeeds → marks order as paid.
-4. **Failure at any step → STOCK_COMPENSATING**: Publishes `stock_add` for each previously subtracted item as compensation.
-5. **STOCK_COMPENSATING → FAILED**: After all compensations acknowledged.
+### 4.1 Stream topology and queue count
 
-**Commands**: `stock_subtract`, `stock_add`, `payment_pay`, `payment_refund`
+Stream names are shard-specific:
 
-**Cross-shard example**: An order on shard 0 subtracting an item on shard 2 sends a `stock_subtract` to `stock-commands-2` with `reply_stream=saga-replies-0`. Stock shard 2 processes it and replies on `saga-replies-0`.
+- stock-commands-{shard}
+- payment-commands-{shard}
+- saga-replies-{shard}
 
-**Polling**: The checkout endpoint polls for completion at 50ms intervals with a 10s timeout.
+With 5 shards, this gives:
 
-## 2PC Protocol (`CHECKOUT_MODE=2pc`)
+- 5 stock command streams
+- 5 payment command streams
+- 5 orchestrator reply streams
+- Total: 15 streams across the deployment
 
-Two-Phase Locking + Two-Phase Commit for checkout. Provides stronger consistency than sagas at the cost of lock contention.
+Each shard has its own saga Redis instance (saga-redis-{0..4}), and stream suffix determines which saga Redis node stores that stream.
 
-### State Machine
+### 4.2 Are queues shared?
 
-```
-PREPARING → COMMITTING → COMMITTED
-     ↓
-  ABORTING → FAILED (or retry on lock_contention)
-```
+Yes and no:
 
-Stored as `tpc:{order_id}` in order-db (msgpack-encoded `TpcState`).
+- Shared by service workers inside the same shard through consumer groups
+- Not shared across shards (each shard has distinct stream names and a distinct saga Redis instance)
 
-### Phase 1: Prepare
+Consumer groups:
 
-1. Items grouped by stock shard. One `stock_prepare` sent per involved shard (containing only that shard's items) + one `payment_prepare`.
-2. `participant_count = distinct_stock_shards + 1` (payment shard).
-3. Each stock participant acquires locks (`SET lock:{item_id} {txn_id} NX PX 30000`) and validates stock availability. Replies `VOTE-COMMIT` or `VOTE-ABORT`.
-4. Payment participant validates credit. Replies `VOTE-COMMIT` or `VOTE-ABORT`.
-5. Votes collected via atomic `INCR` counter on `tpc:{order_id}:vote_count`.
+- stock-workers
+- payment-workers
+- orchestrator-workers
 
-### Phase 2: Commit or Abort
+## 5) Message Reading and Worker Model
 
-- **All VOTE-COMMIT** → `COMMITTING`: Sends `stock_commit` / `payment_commit` to each participant. Stock commit decrements inventory (with `WATCH`-based optimistic locking) and releases locks.
-- **Any VOTE-ABORT** → `ABORTING`: Sends `stock_abort` / `payment_abort` to release locks without data changes.
-- Deterministic idempotency keys for crash-safe re-send: `tpc-{txn_id}-stock_commit-{shard_id}`, `tpc-{txn_id}-payment_commit`, etc.
+Message consumption logic lives in common/streams.py (consume_loop).
 
-### Lock Contention Retry
+### 5.1 Do we have workers?
 
-When abort reason is `lock_contention`:
-- Retries with exponential backoff: `0.1 * 2^retry_count + random(0, 0.05)` seconds
-- Max 5 retries, each with a new `txn_id` (new lock owner)
-- Retries run in a daemon thread
-- Non-retryable failures (`insufficient_stock`, `insufficient_credit`) go directly to `FAILED`
+Yes, two worker layers exist:
 
-**Polling**: Same as saga — 50ms intervals, 10s timeout.
+- Gunicorn workers for HTTP serving
+- Redis stream consumers running inside each worker process
 
-## Fault Tolerance
+There are no separate external worker containers. Consumers run in-process.
 
-### Idempotency
+### 5.2 How messages are read
 
-Every command carries a UUID `idempotency_key`. The consumer checks `SET idempotency:{key} "processing" NX EX 3600` before processing. If the key already exists, the stored reply is re-sent instead of reprocessing. TTL: 1 hour.
+Each consumer loop:
 
-### Dead Consumer Recovery
+1. Builds consumer name as hostname-pid
+2. Runs startup recovery with XAUTOCLAIM (reclaim stale pending messages idle >= 5s)
+3. Reads new messages with XREADGROUP, block=1000ms, count=10
+4. Calls handler function per message
+5. ACKs with XACK after handling
 
-`consume_loop` calls `XAUTOCLAIM` at startup with `min_idle_time=5000ms` to reclaim messages pending for 5+ seconds from dead consumers. Null-fielded messages (deleted entries) are immediately ACKed and skipped.
+This pattern is used for:
 
-### Startup Recovery
+- Stock command consumption
+- Payment command consumption
+- Order orchestrator reply consumption
 
-On each worker startup, guarded by a Redis lock (`recovery_lock`, TTL 30s):
+### 5.3 Duplicate and crash behavior
 
-**Saga recovery** (`recover_sagas`):
-- `STARTED` → marked `FAILED`
-- `STOCK_SUBTRACTING` / `PAYMENT_PENDING` → triggers compensation
-- `STOCK_COMPENSATING` → left for XAUTOCLAIM
+Idempotency keys are stored in business Redis:
 
-**2PC recovery** (`recover_tpcs`):
-- `RETRY_PENDING` → marked `FAILED`
-- `PREPARING` → sends abort
-- `COMMITTING` → re-sends commits (deterministic idempotency keys)
-- `ABORTING` → re-sends aborts
+- First delivery marks idempotency:key as processing
+- Handler stores final reply payload and marks done
+- Duplicate delivery replays stored reply instead of reprocessing
 
-All containers use `restart: always`.
+This protects against redelivery after crashes/restarts.
 
-## Module Structure
+## 6) Threads and Processes per Service
 
-```
-common/
-  streams.py          — Redis Streams helpers, connection pool, idempotency, locks, shard routing
+### 6.1 Gunicorn runtime per app container
 
-order/
-  app.py              — REST endpoints, DB setup, consumer thread, recovery on startup
-  saga_orchestrator.py — saga state machine (start, advance, poll, recover)
-  tpc_orchestrator.py  — 2PC state machine (start, handle votes, poll, recover)
+Every order/stock/payment container runs:
 
-stock/
-  app.py              — REST endpoints, DB setup, consumer thread
-  models.py           — StockValue struct
-  saga_handler.py     — stock_subtract, stock_add handlers
-  tpc_handler.py      — stock_prepare, stock_commit, stock_abort handlers
+- Gunicorn master process
+- 2 gevent worker processes (-w 2)
+- worker-connections=1000 per worker
 
-payment/
-  app.py              — REST endpoints, DB setup, consumer thread
-  models.py           — UserValue struct
-  saga_handler.py     — payment_pay, payment_refund handlers
-  tpc_handler.py      — payment_prepare, payment_commit, payment_abort handlers
-```
+So each app container has 2 request-serving worker processes.
 
-Each `app.py` starts a background thread running `consume_loop` for its service's command stream.
+### 6.2 Background consumer threads
 
-## Deployment
+In each worker process, app startup creates one daemon thread:
 
-### Docker Compose
+- Order worker: orchestrator consumer thread
+- Stock worker: stock command consumer thread
+- Payment worker: payment command consumer thread
 
-```bash
-docker-compose up --build      # start all 36 containers
-docker-compose up --build -d   # background
-docker-compose down            # tear down
-```
+Therefore, per app container:
 
-### Kubernetes
+- 2 worker processes
+- 2 background consumer threads total (1 per worker process)
 
-```bash
-bash deploy-charts-minikube.sh    # Minikube (Redis only)
-bash deploy-charts-cluster.sh     # Cloud (Redis + NGINX Ingress)
-kubectl apply -f k8s/             # App manifests
-```
+What each consumer thread actually does:
 
-### Configuration
+1. Block on the Redis stream with XREADGROUP (up to 1 second)
+2. Receive one or more pending messages from that stream
+3. For each message: run the service handler logic
+4. ACK the message (XACK)
+5. Loop and read again
 
-Environment files in `env/`:
-- `checkout.env` — `CHECKOUT_MODE=saga` (or `2pc`)
-- `saga_redis.env` — saga-redis connection + `SAGA_REDIS_HOST_TEMPLATE=saga-redis-{}`
-- `{order,stock,payment}_redis.env` — per-service Redis connection (overridden per shard in docker-compose)
+Inside one consumer thread, message handling is sequential (one message handler call at a time).
+
+Because each app container has 2 Gunicorn worker processes and each worker starts its own consumer thread, there are typically 2 consumers in the same consumer group for that shard/stream. Redis consumer groups then distribute messages across those 2 consumers.
+
+Practical implication in this deployment:
+
+- Per shard stream (for example stock-commands-2), you can process up to about 2 messages concurrently (one per consumer thread)
+- Per service overall, there are 5 shards x 2 consumers per shard = up to about 10 messages concurrently across all shards
+
+Notes:
+
+- This is an upper bound, not a guarantee. Real throughput depends on message mix, lock contention, Redis latency, and handler execution time.
+- If one message is slow, only that consumer thread is blocked; the other consumer thread in the same shard can still process another message.
+
+Across all 15 app containers:
+
+- 30 gunicorn worker processes
+- 30 consumer threads
+
+Gevent handles HTTP concurrency cooperatively inside each worker process; these are greenlets, not extra OS threads per request.
+
+## 7) Checkout Protocols on Shared Messaging Infrastructure
+
+Both checkout modes use the same stream infrastructure.
+
+- Saga mode: compensating transactions
+- 2PC mode: prepare/commit/abort with lock-based coordination and retries on lock contention
+
+Order service reply handler dispatches replies by command type to saga or 2PC orchestrator logic.
+
+## 8) Current Configuration Notes
+
+Current docker-compose configuration is 5 shards (SHARD_COUNT=5, IDs 0..4).
+
+If shard count changes in deployment config, queue counts and worker totals scale linearly with shard count. The architectural patterns above remain the same.
